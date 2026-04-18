@@ -1,0 +1,25 @@
+[project]
+name = "pokimon"
+version = "0.1.0"
+description = "DCGAN Pokemon image generator"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.3.0",
+    "torchvision>=0.18.0",
+    "pillow>=10.3.0",
+    "numpy>=1.26.0",
+    "tqdm>=4.66.0",
+]
+
+[dependency-groups]
+dev = [
+    "tensorboard>=2.16.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["main", "model", "ops", "utils", "augmentation"]
