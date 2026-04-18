@@ -1,24 +1,28 @@
 """
-model.py — DCGAN Generator, Discriminator, and training harness (PyTorch)
+model.py — WGAN-GP Generator, Critic, and training harness (PyTorch)
 
-Architecture is a faithful port of the blueprint:
-  Generator  : z[100] → linear → 4×4×512 → 4× deconv → 64×64×3,  tanh out
-  Discriminator: 64×64×3 → 4× conv → flatten → linear → 1,  sigmoid out
+Architecture:
+  Generator : z[100] → linear → 4×4×512 → 4× deconv → 64×64×3, tanh out
+  Critic    : 64×64×3 → 4× conv → flatten → linear → 1, unbounded score
 
-Key design decisions preserved (from BLUEPRINT.md §12):
-  - Noise dist: Normal(-1, 1)  (NOT uniform)
-  - Generator hidden activations: LeakyReLU(0.2) on ALL hidden layers
-  - G updated 2× always + optional 3rd update if errG - errD > 1
-  - BN: synchronous update (PyTorch default), scale=True (affine=True)
-  - No BN on Discriminator's first conv layer
-  - No BN on Generator's final deconv layer
+WGAN-GP (Wasserstein GAN with Gradient Penalty, Gulrajani et al. 2017):
+  - Critic loss: E[C(fake)] − E[C(real)] + λ·GP
+  - Generator loss: −E[C(G(z))]
+  - Gradient penalty enforces the 1-Lipschitz constraint on the critic
+  - Critic updated n_critic=5 times per generator step
 
-Performance improvements over the TF1 original:
-  - torch.utils.data.DataLoader with num_workers for parallel I/O
-  - torch.amp (Automatic Mixed Precision) on CUDA / MPS
+Key design decisions:
+  - No BatchNorm in Critic: BN creates inter-sample correlation that corrupts
+    the gradient penalty's Lipschitz enforcement
+  - Generator keeps BatchNorm on all hidden layers
+  - Noise distribution: Normal(-1, 1) — empirically better for Pokémon sprites
+  - Hidden activations: LeakyReLU(0.2) in both Generator and Critic
+  - Adam(lr=1e-4, β1=0, β2=0.9) — WGAN-GP recommended optimizer settings
+
+Performance:
+  - DataLoader with num_workers for parallel I/O
   - Apple Silicon MPS backend supported
-  - Gradient scaler for AMP stability
-  - torch.compile() opt-in (Python ≥ 3.12, PyTorch ≥ 2.0)
+  - torch.compile() opt-in via --compile flag
 """
 
 from __future__ import annotations
@@ -30,7 +34,6 @@ from glob import glob
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -89,12 +92,11 @@ class PokemonDataset(Dataset):
             crop=self.crop,
             grayscale=self.grayscale,
         )
-        # [H, W, C] or [H, W] → [C, H, W]
         tensor = torch.from_numpy(img)
         if tensor.ndim == 2:
-            tensor = tensor.unsqueeze(0)  # grayscale → [1, H, W]
+            tensor = tensor.unsqueeze(0)          # grayscale → [1, H, W]
         else:
-            tensor = tensor.permute(2, 0, 1)  # [H, W, C] → [C, H, W]
+            tensor = tensor.permute(2, 0, 1)      # [H, W, C] → [C, H, W]
         return tensor.float()
 
 
@@ -108,13 +110,13 @@ class Generator(nn.Module):
     Noise → Image upsampling network.
 
     z [B, 100]
-    → linear  → [B, gf*8 * 4 * 4]
-    → reshape  → [B, gf*8, 4, 4]
+    → linear   → [B, gf*8 * 4 * 4]
+    → reshape   → [B, gf*8, 4, 4]
     → BN + LReLU
-    → deconv   → [B, gf*4, 8, 8]   BN + LReLU
-    → deconv   → [B, gf*2, 16, 16] BN + LReLU
-    → deconv   → [B, gf*1, 32, 32] BN + LReLU
-    → deconv   → [B, c_dim, 64, 64] tanh
+    → deconv    → [B, gf*4, 8, 8]   BN + LReLU
+    → deconv    → [B, gf*2, 16, 16] BN + LReLU
+    → deconv    → [B, gf*1, 32, 32] BN + LReLU
+    → deconv    → [B, c_dim, 64, 64] tanh  (no BN on final layer)
     """
 
     def __init__(
@@ -143,7 +145,6 @@ class Generator(nn.Module):
 
         self.h0_lin = linear(z_dim, gf_dim * 8 * s_h16 * s_w16)
 
-        # hidden: BN + LReLU
         self.bn0 = batch_norm(gf_dim * 8)
         self.h1 = deconv2d(gf_dim * 8, gf_dim * 4)
         self.bn1 = batch_norm(gf_dim * 4)
@@ -151,13 +152,11 @@ class Generator(nn.Module):
         self.bn2 = batch_norm(gf_dim * 2)
         self.h3 = deconv2d(gf_dim * 2, gf_dim * 1)
         self.bn3 = batch_norm(gf_dim * 1)
-        # final: no BN
-        self.h4 = deconv2d(gf_dim * 1, c_dim)
+        self.h4 = deconv2d(gf_dim * 1, c_dim)  # no BN
 
         self.act = lrelu(0.2)
 
     def forward(self, z: torch.Tensor, train: bool = True) -> torch.Tensor:
-        # Set BN to train/eval mode explicitly (used by sampler)
         for mod in [self.bn0, self.bn1, self.bn2, self.bn3]:
             mod.training = train
 
@@ -173,21 +172,24 @@ class Generator(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Discriminator
+# Critic  (no sigmoid, no BatchNorm)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class Discriminator(nn.Module):
+class Critic(nn.Module):
     """
-    Image → real/fake probability.
+    Image → unbounded Wasserstein score.
+
+    No sigmoid: WGAN scores are unbounded reals (higher = more real).
+    No BatchNorm: BN introduces inter-sample correlation that corrupts
+    the gradient penalty's Lipschitz enforcement.
 
     [B, c_dim, 64, 64]
-    → conv   → [B, df,   32, 32]  LReLU (NO BN — DCGAN rule)
-    → conv   → [B, df*2, 16, 16]  BN + LReLU
-    → conv   → [B, df*4,  8,  8]  BN + LReLU
-    → conv   → [B, df*8,  4,  4]  BN + LReLU
-    → flatten → linear → [B, 1] → sigmoid
-    Returns: (sigmoid_output, logits)
+    → conv 5×5/s2 → [B, df,   32, 32]  LReLU
+    → conv 5×5/s2 → [B, df*2, 16, 16]  LReLU
+    → conv 5×5/s2 → [B, df*4,  8,  8]  LReLU
+    → conv 5×5/s2 → [B, df*8,  4,  4]  LReLU
+    → flatten → linear → [B, 1]        (unbounded score)
     """
 
     def __init__(
@@ -206,42 +208,34 @@ class Discriminator(nn.Module):
         s4w = conv_out_size_same(
             conv_out_size_same(conv_out_size_same(conv_out_size_same(input_width)))
         )  # 4
-        flat_dim = df_dim * 8 * s4 * s4w  # 512*4*4 = 8192
+        flat_dim = df_dim * 8 * s4 * s4w  # 8192
 
-        # Layer 0: NO BN
+        # No BatchNorm anywhere in the critic
         self.h0 = conv2d(c_dim, df_dim)
-        # Layers 1-3: BN
         self.h1 = conv2d(df_dim, df_dim * 2)
         self.h2 = conv2d(df_dim * 2, df_dim * 4)
         self.h3 = conv2d(df_dim * 4, df_dim * 8)
-        self.bn1 = batch_norm(df_dim * 2)
-        self.bn2 = batch_norm(df_dim * 4)
-        self.bn3 = batch_norm(df_dim * 8)
-
         self.h4 = linear(flat_dim, 1)
         self.act = lrelu(0.2)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        x = self.act(self.h0(x))  # no BN
-        x = self.act(self.bn1(self.h1(x)))
-        x = self.act(self.bn2(self.h2(x)))
-        x = self.act(self.bn3(self.h3(x)))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.act(self.h0(x))
+        x = self.act(self.h1(x))
+        x = self.act(self.h2(x))
+        x = self.act(self.h3(x))
         x = x.view(x.size(0), -1)
-        logits = self.h4(x)
-        return torch.sigmoid(logits), logits
+        return self.h4(x)  # [B, 1] unbounded score
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DCGAN training harness
+# WGAN-GP training harness
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class DCGAN:
+class WGAN:
     """
-    High-level wrapper that owns Generator, Discriminator, optimisers, and
-    the training loop.
-
-    Maps to the original DCGAN class in the blueprint; adapted for PyTorch.
+    High-level wrapper that owns Generator, Critic, optimizers, and
+    the WGAN-GP training loop (Gulrajani et al. 2017).
     """
 
     def __init__(
@@ -262,6 +256,8 @@ class DCGAN:
         checkpoint_dir: str = "checkpoint",
         sample_dir: str = "samples",
         compile_model: bool = False,
+        n_critic: int = 5,
+        lambda_gp: float = 10.0,
     ):
         self.input_height = input_height
         self.input_width = input_width
@@ -279,6 +275,8 @@ class DCGAN:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.sample_dir = Path(sample_dir)
         self.grayscale = c_dim == 1
+        self.n_critic = n_critic
+        self.lambda_gp = lambda_gp
 
         # ── Device selection: CUDA > MPS (Apple Silicon) > CPU ────────────────
         if torch.cuda.is_available():
@@ -298,7 +296,7 @@ class DCGAN:
             output_width=output_width,
         ).to(self.device)
 
-        self.netD = Discriminator(
+        self.netC = Critic(
             df_dim=df_dim,
             c_dim=c_dim,
             input_height=output_height,
@@ -309,12 +307,7 @@ class DCGAN:
         if compile_model and hasattr(torch, "compile"):
             print("[*] torch.compile() enabled")
             self.netG = torch.compile(self.netG)  # type: ignore[assignment]
-            self.netD = torch.compile(self.netD)  # type: ignore[assignment]
-
-        # ── AMP scaler (CUDA only; MPS uses float32 natively) ─────────────────
-        self._use_amp = self.device.type == "cuda"
-        self.scaler_g = torch.amp.GradScaler(enabled=self._use_amp)
-        self.scaler_d = torch.amp.GradScaler(enabled=self._use_amp)
+            self.netC = torch.compile(self.netC)  # type: ignore[assignment]
 
     # ── Convenience ──────────────────────────────────────────────────────────
 
@@ -325,18 +318,47 @@ class DCGAN:
     def _sample_z(self, n: Optional[int] = None) -> torch.Tensor:
         """Sample noise z ~ N(-1, 1) on the correct device."""
         size = n or self.batch_size
-        # mean=-1, std=1 reproduced as randn()*1 + (-1)
         return torch.randn(size, self.z_dim, device=self.device) - 1.0
+
+    def _gradient_penalty(
+        self, real: torch.Tensor, fake: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        WGAN-GP gradient penalty (Gulrajani et al. 2017).
+
+        Samples random interpolations between real and fake images, runs them
+        through the critic, then penalises gradients whose L2 norm deviates from 1.
+
+          GP = E[(||∇_x̂ C(x̂)||₂ − 1)²]
+          x̂  = ε·real + (1−ε)·fake,   ε ~ Uniform(0, 1)
+        """
+        B = real.size(0)
+        alpha = torch.rand(B, 1, 1, 1, device=self.device)
+        interpolated = (
+            alpha * real.detach() + (1 - alpha) * fake.detach()
+        ).requires_grad_(True)
+
+        c_interp = self.netC(interpolated)
+
+        gradients = torch.autograd.grad(
+            outputs=c_interp,
+            inputs=interpolated,
+            grad_outputs=torch.ones_like(c_interp),
+            create_graph=True,
+            retain_graph=True,
+        )[0]
+
+        gradients = gradients.view(B, -1)
+        return ((gradients.norm(2, dim=1) - 1) ** 2).mean()
 
     # ── Training ─────────────────────────────────────────────────────────────
 
     def train(self, config: object) -> None:
         """
-        Main training loop faithful to blueprint §7.7 / TRAINING.md:
-          - D updated once per batch
-          - G updated twice always
-          - G updated a third time if errG - (errD_fake + errD_real) > 1
-          - Sample grid saved every 100 counter steps
+        WGAN-GP training loop:
+          - Critic updated n_critic times per generator step
+          - Gradient penalty enforces the 1-Lipschitz constraint
+          - Sample grid saved every 100 steps
           - Checkpoint saved every 10 epochs
         """
         data_dir = Path("./data") / self.dataset_name
@@ -352,7 +374,6 @@ class DCGAN:
         )
         print(f"[*] Dataset: {len(dataset)} images")
 
-        # num_workers: use up to 4 workers; pin_memory on CUDA
         num_workers = min(4, os.cpu_count() or 1)
         loader = DataLoader(
             dataset,
@@ -360,15 +381,19 @@ class DCGAN:
             shuffle=True,
             num_workers=num_workers,
             pin_memory=(self.device.type == "cuda"),
-            drop_last=True,  # keep batch sizes constant
+            drop_last=True,
             persistent_workers=(num_workers > 0),
         )
 
-        # ── Optimisers (Adam, lr=0.0002, β1=0.5) ─────────────────────────────
-        lr = getattr(config, "learning_rate", 0.0002)
-        beta1 = getattr(config, "beta1", 0.5)
-        d_optim = torch.optim.Adam(self.netD.parameters(), lr=lr, betas=(beta1, 0.999))
-        g_optim = torch.optim.Adam(self.netG.parameters(), lr=lr, betas=(beta1, 0.999))
+        # ── Optimizers: Adam(lr=1e-4, β1=0, β2=0.9) — WGAN-GP paper settings ──
+        lr = getattr(config, "learning_rate", 1e-4)
+        beta1 = getattr(config, "beta1", 0.0)
+        c_optim = torch.optim.Adam(
+            self.netC.parameters(), lr=lr, betas=(beta1, 0.9)
+        )
+        g_optim = torch.optim.Adam(
+            self.netG.parameters(), lr=lr, betas=(beta1, 0.9)
+        )
 
         # ── TensorBoard writer ────────────────────────────────────────────────
         log_dir = Path("./logs") / self.dataset_name
@@ -389,81 +414,59 @@ class DCGAN:
         else:
             print(" [!] No checkpoint found — training from scratch")
 
-        bce = nn.BCEWithLogitsLoss()
-
         epochs = getattr(config, "epoch", 2000)
+        n_critic = getattr(config, "n_critic", self.n_critic)
+        lambda_gp = getattr(config, "lambda_gp", self.lambda_gp)
         start_time = time.time()
 
         for epoch in range(epochs):
             self.netG.train()
-            self.netD.train()
+            self.netC.train()
 
             pbar = tqdm(loader, desc=f"Epoch {epoch + 1}/{epochs}", leave=False)
 
             for batch_images in pbar:
                 batch_images = batch_images.to(self.device, non_blocking=True)
-                batch_z = self._sample_z()
 
-                real_labels = torch.ones(self.batch_size, 1, device=self.device)
-                fake_labels = torch.zeros(self.batch_size, 1, device=self.device)
+                # ── Update Critic n_critic times ──────────────────────────────
+                c_loss_val = gp_val = w_dist_val = 0.0
+                for _ in range(n_critic):
+                    self.netC.zero_grad(set_to_none=True)
+                    z = self._sample_z()
+                    fake_imgs = self.netG(z).detach()  # stop G gradients
 
-                # ── Update D once ─────────────────────────────────────────────
-                self.netD.zero_grad(set_to_none=True)
-                amp_ctx = torch.amp.autocast(
-                    device_type=self.device.type, enabled=self._use_amp
-                )
+                    c_real = self.netC(batch_images)
+                    c_fake = self.netC(fake_imgs)
+                    gp = self._gradient_penalty(batch_images, fake_imgs)
 
-                with amp_ctx:
-                    _, d_real_logits = self.netD(batch_images)
-                    fake_imgs = self.netG(batch_z)
-                    _, d_fake_logits = self.netD(fake_imgs.detach())
-                    d_loss_real = bce(d_real_logits, real_labels)
-                    d_loss_fake = bce(d_fake_logits, fake_labels)
-                    d_loss = d_loss_real + d_loss_fake
+                    c_loss = c_fake.mean() - c_real.mean() + lambda_gp * gp
+                    c_loss.backward()
+                    c_optim.step()
 
-                self.scaler_d.scale(d_loss).backward()
-                self.scaler_d.step(d_optim)
-                self.scaler_d.update()
+                    c_loss_val = c_loss.item()
+                    gp_val = gp.item()
+                    w_dist_val = (c_real.mean() - c_fake.mean()).item()
 
-                # ── Update G twice (always) ───────────────────────────────────
-                for _ in range(2):
-                    self.netG.zero_grad(set_to_none=True)
-                    batch_z_g = self._sample_z()
-                    with amp_ctx:
-                        fake_imgs_g = self.netG(batch_z_g)
-                        _, d_fake_logits_g = self.netD(fake_imgs_g)
-                        g_loss = bce(d_fake_logits_g, real_labels)
-                    self.scaler_g.scale(g_loss).backward()
-                    self.scaler_g.step(g_optim)
-                    self.scaler_g.update()
+                # ── Update Generator once ─────────────────────────────────────
+                self.netG.zero_grad(set_to_none=True)
+                z = self._sample_z()
+                g_loss = -self.netC(self.netG(z)).mean()
+                g_loss.backward()
+                g_optim.step()
 
-                # ── Compute losses for logging / conditional update ────────────
-                errD_fake = d_loss_fake.item()
-                errD_real = d_loss_real.item()
-                errG = g_loss.item()
-
-                # ── Conditional third G update ────────────────────────────────
-                if errG - (errD_fake + errD_real) > 1.0:
-                    self.netG.zero_grad(set_to_none=True)
-                    batch_z_extra = self._sample_z()
-                    with amp_ctx:
-                        fake_extra = self.netG(batch_z_extra)
-                        _, d_fake_extra = self.netD(fake_extra)
-                        g_loss_extra = bce(d_fake_extra, real_labels)
-                    self.scaler_g.scale(g_loss_extra).backward()
-                    self.scaler_g.step(g_optim)
-                    self.scaler_g.update()
+                g_loss_val = g_loss.item()
 
                 # ── TensorBoard logging ───────────────────────────────────────
-                writer.add_scalar("Loss/D", errD_real + errD_fake, counter)
-                writer.add_scalar("Loss/G", errG, counter)
-                writer.add_scalar("Loss/D_real", errD_real, counter)
-                writer.add_scalar("Loss/D_fake", errD_fake, counter)
+                writer.add_scalar("Loss/Critic", c_loss_val, counter)
+                writer.add_scalar("Loss/Generator", g_loss_val, counter)
+                writer.add_scalar("Loss/Wasserstein", w_dist_val, counter)
+                writer.add_scalar("Loss/GradientPenalty", gp_val, counter)
 
                 pbar.set_postfix(
                     {
-                        "d_loss": f"{errD_real + errD_fake:.4f}",
-                        "g_loss": f"{errG:.4f}",
+                        "c_loss": f"{c_loss_val:.4f}",
+                        "g_loss": f"{g_loss_val:.4f}",
+                        "W_dist": f"{w_dist_val:.4f}",
                         "t": f"{time.time() - start_time:.0f}s",
                     }
                 )
@@ -494,20 +497,16 @@ class DCGAN:
         samples = self.netG(sample_z, train=False)
         self.netG.train()
 
-        # [B, C, H, W] → [B, H, W, C]
         samples_np = samples.cpu().permute(0, 2, 3, 1).numpy()
         rows, cols = image_manifold_size(samples_np.shape[0])
 
         out_path = self.sample_dir / f"train_{epoch:02d}_{counter:06d}.png"
         save_images(samples_np, [rows, cols], out_path)
 
-        # Push to TensorBoard as image grid
         if writer is not None:
-            # torchvision expects [B, C, H, W] in [0, 1]
             grid_tensor = samples.clamp(-1, 1) * 0.5 + 0.5
             try:
                 from torchvision.utils import make_grid
-
                 grid = make_grid(grid_tensor, nrow=cols)
                 writer.add_image("Generated/samples", grid, counter)
             except ImportError:
@@ -518,18 +517,18 @@ class DCGAN:
     def save(self, checkpoint_dir: str, step: int) -> None:
         save_dir = Path(checkpoint_dir) / self.model_dir
         save_dir.mkdir(parents=True, exist_ok=True)
-        path = save_dir / f"DCGAN.model-{step}.pt"
+        path = save_dir / f"WGAN.model-{step}.pt"
         torch.save(
             {
                 "step": step,
                 "generator": self.netG.state_dict(),
-                "discriminator": self.netD.state_dict(),
+                "critic": self.netC.state_dict(),
             },
             path,
         )
         # Keep only last 5 checkpoints
         ckpts = sorted(
-            save_dir.glob("DCGAN.model-*.pt"),
+            save_dir.glob("WGAN.model-*.pt"),
             key=lambda p: int(re.search(r"(\d+)", p.stem).group(1)),
         )
         for old in ckpts[:-5]:
@@ -543,7 +542,7 @@ class DCGAN:
             return False, 0
 
         ckpts = sorted(
-            ckpt_dir.glob("DCGAN.model-*.pt"),
+            ckpt_dir.glob("WGAN.model-*.pt"),
             key=lambda p: int(re.search(r"(\d+)", p.stem).group(1)),
         )
         if not ckpts:
@@ -552,7 +551,7 @@ class DCGAN:
         latest = ckpts[-1]
         state = torch.load(latest, map_location=self.device, weights_only=True)
         self.netG.load_state_dict(state["generator"])
-        self.netD.load_state_dict(state["discriminator"])
+        self.netC.load_state_dict(state["critic"])
         step = state.get("step", 0)
         print(f" [*] Loaded checkpoint: {latest.name}  (step {step})")
         return True, step

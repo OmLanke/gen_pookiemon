@@ -1,13 +1,13 @@
 """
-ops.py — DCGAN layer primitives (PyTorch)
+ops.py — WGAN-GP layer primitives (PyTorch)
 
-Faithful port of the original TF1.x ops.py.
-Design decisions preserved from the blueprint:
-  - LeakyReLU(0.2) used in BOTH Generator and Discriminator hidden layers
-  - Batch norm with epsilon=1e-5, momentum=0.1 (PyTorch convention; TF momentum=0.9 = 1-0.1)
+Shared building blocks for Generator and Critic.
+Design decisions:
+  - LeakyReLU(0.2) used in BOTH Generator and Critic hidden layers
+  - BatchNorm used ONLY in the Generator (not in the Critic — see model.py)
+  - Batch norm: epsilon=1e-5, momentum=0.1 (PyTorch convention)
   - Weights init: truncated_normal(stddev=0.02) for conv, normal(stddev=0.02) for deconv/linear
-  - No BN on Discriminator's first layer (DCGAN rule)
-  - No BN on Generator's final layer
+  - No BN on Generator's final deconv layer
 """
 
 from __future__ import annotations
