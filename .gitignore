@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+# pokemon_dataset/
+data/
+.DS_Store
