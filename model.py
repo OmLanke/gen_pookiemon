@@ -422,6 +422,12 @@ class WGAN:
         lambda_gp = getattr(config, "lambda_gp", self.lambda_gp)
         start_time = time.time()
 
+        # Warm up the CUDA context so cuBLAS is initialised before the first
+        # backward pass (avoids the "no current CUDA context" UserWarning).
+        if self.device.type == "cuda":
+            _ = torch.zeros(1, device=self.device)
+            torch.cuda.synchronize()
+
         for epoch in range(epochs):
             self.netG.train()
             self.netC.train()
