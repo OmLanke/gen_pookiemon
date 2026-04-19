@@ -31,7 +31,7 @@ def imread(path: str | Path, grayscale: bool = False) -> np.ndarray:
         img = img.convert("L")
     else:
         img = img.convert("RGB")
-    return np.array(img, dtype=np.float64)
+    return np.array(img, dtype=np.float32)
 
 
 def imsave(images: np.ndarray, size: list[int], path: str | Path) -> None:
@@ -76,7 +76,7 @@ def center_crop(
     cropped = x[j : j + crop_h, i : i + crop_w]
     img = Image.fromarray(cropped.astype(np.uint8))
     img = img.resize((resize_w, resize_h), Image.LANCZOS)
-    return np.array(img, dtype=np.float64)
+    return np.array(img, dtype=np.float32)
 
 
 def transform(
@@ -97,7 +97,7 @@ def transform(
     else:
         img = Image.fromarray(image.astype(np.uint8))
         img = img.resize((resize_width, resize_height), Image.LANCZOS)
-        out = np.array(img, dtype=np.float64)
+        out = np.array(img, dtype=np.float32)
     return normalize(out)
 
 

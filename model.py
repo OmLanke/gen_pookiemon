@@ -23,6 +23,8 @@ Performance:
   - DataLoader with num_workers for parallel I/O
   - Apple Silicon MPS backend supported
   - torch.compile() opt-in via --compile flag
+  - AMP (automatic mixed precision) opt-in via --amp flag
+    Uses FP16 Tensor Cores on T4/A100; GP computed in FP32 for correctness
 """
 
 from __future__ import annotations
@@ -94,9 +96,9 @@ class PokemonDataset(Dataset):
         )
         tensor = torch.from_numpy(img)
         if tensor.ndim == 2:
-            tensor = tensor.unsqueeze(0)          # grayscale → [1, H, W]
+            tensor = tensor.unsqueeze(0)  # grayscale → [1, H, W]
         else:
-            tensor = tensor.permute(2, 0, 1)      # [H, W, C] → [C, H, W]
+            tensor = tensor.permute(2, 0, 1)  # [H, W, C] → [C, H, W]
         return tensor.float()
 
 
@@ -156,10 +158,7 @@ class Generator(nn.Module):
 
         self.act = lrelu(0.2)
 
-    def forward(self, z: torch.Tensor, train: bool = True) -> torch.Tensor:
-        for mod in [self.bn0, self.bn1, self.bn2, self.bn3]:
-            mod.training = train
-
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
         x = self.h0_lin(z)
         x = x.view(-1, self.gf_dim * 8, self._s_h16, self._s_w16)
         x = self.act(self.bn0(x))
@@ -258,6 +257,7 @@ class WGAN:
         compile_model: bool = False,
         n_critic: int = 5,
         lambda_gp: float = 10.0,
+        use_amp: bool = False,
     ):
         self.input_height = input_height
         self.input_width = input_width
@@ -286,6 +286,14 @@ class WGAN:
         else:
             self.device = torch.device("cpu")
         print(f"[*] Using device: {self.device}")
+
+        # AMP only makes sense on CUDA; silently disable elsewhere
+        self.use_amp = use_amp and (self.device.type == "cuda")
+        if use_amp and not self.use_amp:
+            print("[!] AMP requested but device is not CUDA — AMP disabled")
+        # GradScaler is used only for the generator step (critic has GP which
+        # must stay in FP32, so we skip scaling there to avoid complications)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
         # ── Models ────────────────────────────────────────────────────────────
         self.netG = Generator(
@@ -320,9 +328,7 @@ class WGAN:
         size = n or self.batch_size
         return torch.randn(size, self.z_dim, device=self.device) - 1.0
 
-    def _gradient_penalty(
-        self, real: torch.Tensor, fake: torch.Tensor
-    ) -> torch.Tensor:
+    def _gradient_penalty(self, real: torch.Tensor, fake: torch.Tensor) -> torch.Tensor:
         """
         WGAN-GP gradient penalty (Gulrajani et al. 2017).
 
@@ -383,17 +389,14 @@ class WGAN:
             pin_memory=(self.device.type == "cuda"),
             drop_last=True,
             persistent_workers=(num_workers > 0),
+            prefetch_factor=2 if num_workers > 0 else None,
         )
 
         # ── Optimizers: Adam(lr=1e-4, β1=0, β2=0.9) — WGAN-GP paper settings ──
         lr = getattr(config, "learning_rate", 1e-4)
         beta1 = getattr(config, "beta1", 0.0)
-        c_optim = torch.optim.Adam(
-            self.netC.parameters(), lr=lr, betas=(beta1, 0.9)
-        )
-        g_optim = torch.optim.Adam(
-            self.netG.parameters(), lr=lr, betas=(beta1, 0.9)
-        )
+        c_optim = torch.optim.Adam(self.netC.parameters(), lr=lr, betas=(beta1, 0.9))
+        g_optim = torch.optim.Adam(self.netG.parameters(), lr=lr, betas=(beta1, 0.9))
 
         # ── TensorBoard writer ────────────────────────────────────────────────
         log_dir = Path("./logs") / self.dataset_name
@@ -433,11 +436,18 @@ class WGAN:
                 for _ in range(n_critic):
                     self.netC.zero_grad(set_to_none=True)
                     z = self._sample_z()
-                    fake_imgs = self.netG(z).detach()  # stop G gradients
 
-                    c_real = self.netC(batch_images)
-                    c_fake = self.netC(fake_imgs)
-                    gp = self._gradient_penalty(batch_images, fake_imgs)
+                    # Forward passes in FP16 when AMP is on
+                    with torch.amp.autocast("cuda", enabled=self.use_amp):
+                        fake_imgs = self.netG(z).detach()  # stop G gradients
+                        c_real = self.netC(batch_images)
+                        c_fake = self.netC(fake_imgs)
+
+                    # GP must be in FP32: disable autocast and cast inputs
+                    with torch.amp.autocast("cuda", enabled=False):
+                        gp = self._gradient_penalty(
+                            batch_images.float(), fake_imgs.float()
+                        )
 
                     c_loss = c_fake.mean() - c_real.mean() + lambda_gp * gp
                     c_loss.backward()
@@ -450,17 +460,20 @@ class WGAN:
                 # ── Update Generator once ─────────────────────────────────────
                 self.netG.zero_grad(set_to_none=True)
                 z = self._sample_z()
-                g_loss = -self.netC(self.netG(z)).mean()
-                g_loss.backward()
-                g_optim.step()
+                with torch.amp.autocast("cuda", enabled=self.use_amp):
+                    g_loss = -self.netC(self.netG(z)).mean()
+                self.scaler.scale(g_loss).backward()
+                self.scaler.step(g_optim)
+                self.scaler.update()
 
                 g_loss_val = g_loss.item()
 
-                # ── TensorBoard logging ───────────────────────────────────────
-                writer.add_scalar("Loss/Critic", c_loss_val, counter)
-                writer.add_scalar("Loss/Generator", g_loss_val, counter)
-                writer.add_scalar("Loss/Wasserstein", w_dist_val, counter)
-                writer.add_scalar("Loss/GradientPenalty", gp_val, counter)
+                # ── TensorBoard logging (every 10 steps to reduce I/O overhead)
+                if counter % 10 == 0:
+                    writer.add_scalar("Loss/Critic", c_loss_val, counter)
+                    writer.add_scalar("Loss/Generator", g_loss_val, counter)
+                    writer.add_scalar("Loss/Wasserstein", w_dist_val, counter)
+                    writer.add_scalar("Loss/GradientPenalty", gp_val, counter)
 
                 pbar.set_postfix(
                     {
@@ -494,7 +507,7 @@ class WGAN:
         writer: Optional[SummaryWriter] = None,
     ) -> None:
         self.netG.eval()
-        samples = self.netG(sample_z, train=False)
+        samples = self.netG(sample_z)
         self.netG.train()
 
         samples_np = samples.cpu().permute(0, 2, 3, 1).numpy()
@@ -507,6 +520,7 @@ class WGAN:
             grid_tensor = samples.clamp(-1, 1) * 0.5 + 0.5
             try:
                 from torchvision.utils import make_grid
+
                 grid = make_grid(grid_tensor, nrow=cols)
                 writer.add_image("Generated/samples", grid, counter)
             except ImportError:

@@ -53,9 +53,7 @@ def parse_args() -> argparse.Namespace:
     # Architecture
     p.add_argument("--z_dim", type=int, default=100, help="Noise vector dimension")
     p.add_argument("--gf_dim", type=int, default=64, help="Generator base filter count")
-    p.add_argument(
-        "--df_dim", type=int, default=64, help="Critic base filter count"
-    )
+    p.add_argument("--df_dim", type=int, default=64, help="Critic base filter count")
     p.add_argument(
         "--c_dim", type=int, default=3, help="Image channels (3=RGB, 1=grayscale)"
     )
@@ -111,6 +109,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable torch.compile() for faster training (PyTorch ≥ 2.0)",
     )
+    p.add_argument(
+        "--amp",
+        action="store_true",
+        help="Enable AMP (FP16 mixed precision) — recommended for T4/A100 (CUDA only)",
+    )
 
     return p.parse_args()
 
@@ -145,6 +148,7 @@ def main() -> None:
         checkpoint_dir=config.checkpoint_dir,
         sample_dir=config.sample_dir,
         compile_model=config.compile,
+        use_amp=config.amp,
         n_critic=config.n_critic,
         lambda_gp=config.lambda_gp,
     )
