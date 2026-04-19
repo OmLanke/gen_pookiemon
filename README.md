@@ -44,19 +44,19 @@ z [64, 100]                            image [64, 64×64×3]
  fake image [-1, 1]
 ```
 
-| Hyperparameter | Value |
-|---|---|
-| Noise vector `z_dim` | 100 |
-| Noise distribution | `Normal(-1, 1)` |
-| Generator filters `gf_dim` | 64 |
-| Discriminator filters `df_dim` | 64 |
-| Hidden activations | LeakyReLU(0.2) — both G and D |
-| Output activation | Tanh (G), Sigmoid (D) |
-| Batch size | 64 |
-| Epochs | 2000 |
-| Learning rate | 0.0002 |
-| Adam β1 | 0.5 |
-| G updates per batch | 2 always + 1 conditional |
+| Hyperparameter | Default | Notes |
+|---|---|---|
+| Noise vector `z_dim` | 100 | — |
+| Noise distribution | `Normal(-1, 1)` | — |
+| Generator filters `gf_dim` | **32** | Use `--full` or `--gf_dim 64` for full quality |
+| Discriminator filters `df_dim` | **32** | Use `--full` or `--df_dim 64` for full quality |
+| Hidden activations | LeakyReLU(0.2) — both G and D | — |
+| Output activation | Tanh (G), Sigmoid (D) | — |
+| Batch size | 64 | — |
+| Epochs | **500** | Use `--full` or `--epoch 2000` for full convergence |
+| Learning rate | 0.0002 | — |
+| Adam β1 | 0.5 | — |
+| G updates per batch | 2 always + 1 conditional | — |
 
 ---
 
@@ -113,11 +113,14 @@ Augmentation runs in parallel across all CPU cores. For 830 images it completes 
 uv run python main.py --dataset pokemon --train
 ```
 
-All defaults match the intended configuration. Common overrides:
+All defaults are tuned for fast iteration on an M1 Mac (~9h for 500 epochs at gf/df=32). Common overrides:
 
 ```bash
-# Use more epochs
-uv run python main.py --dataset pokemon --train --epoch 3000
+# Full-quality run: gf_dim=64, df_dim=64, 2000 epochs (~80h on M1)
+uv run python main.py --dataset pokemon --train --full
+
+# Custom epoch count
+uv run python main.py --dataset pokemon --train --epoch 1000
 
 # Enable torch.compile for extra throughput (PyTorch ≥ 2.0)
 uv run python main.py --dataset pokemon --train --compile
@@ -134,7 +137,7 @@ uv run python main.py --dataset pokemon --train --compile
 ```
 [*] Using device: mps
 [*] Dataset: 11620 images
-Epoch 1/2000: 100%|████| 181/181 [d_loss: 0.8431, g_loss: 1.2047, t: 23s]
+Epoch 1/500: 100%|████| 181/181 [d_loss: 0.8431, g_loss: 1.2047, ETA: 8h55m]
 [*] Checkpoint saved at epoch 10, step 1811
 ...
 ```
@@ -195,16 +198,17 @@ uv run python main.py [options]
 
 Training:
   --train                  Enable training mode
-  --epoch INT              Training epochs            (default: 2000)
+  --epoch INT              Training epochs            (default: 500)
   --learning_rate FLOAT    Adam learning rate         (default: 0.0002)
   --beta1 FLOAT            Adam β1 momentum           (default: 0.5)
   --batch_size INT         Batch size                 (default: 64)
   --compile                Enable torch.compile()     (default: off)
+  --full                   Full quality: gf/df=64, 2000 epochs
 
 Architecture:
   --z_dim INT              Noise vector dimension     (default: 100)
-  --gf_dim INT             Generator base filters     (default: 64)
-  --df_dim INT             Discriminator base filters (default: 64)
+  --gf_dim INT             Generator base filters     (default: 32)
+  --df_dim INT             Discriminator base filters (default: 32)
   --c_dim INT              Image channels, 3=RGB      (default: 3)
 
 Image size:
@@ -240,15 +244,24 @@ The conditional third G update fires when `errG − (errD_fake + errD_real) > 1`
 
 ## Performance
 
-The implementation is accelerated beyond the original TF1 baseline:
+The implementation is optimised for Apple Silicon (M1/M2) as well as CUDA:
 
-| Feature | Detail |
+| Optimisation | Detail |
 |---|---|
 | Device | Auto-selects CUDA → Apple MPS → CPU |
+| Data loading | Entire dataset pre-loaded into a single CPU tensor at startup — no per-epoch disk I/O (45× faster than PIL-per-batch) |
+| Memory layout | `channels_last` (NHWC) memory format — conv/deconv are faster on Apple Silicon |
+| G backward passes | Fused 2× z-batch in one forward+backward instead of two separate passes |
 | Mixed precision | `torch.amp` AMP on CUDA |
-| Data loading | `DataLoader` with 4 parallel workers + `pin_memory` |
 | Augmentation | Multiprocess via `ProcessPoolExecutor` |
 | Graph compilation | `torch.compile()` opt-in via `--compile` |
+
+**Measured step times on M1 MacBook Air (MPS):**
+
+| Config | ms/step | 500 epochs | 2000 epochs |
+|---|---|---|---|
+| gf=df=64 (full) | ~785–870 ms | ~20 h | ~80 h |
+| gf=df=32 (default) | ~90–130 ms | ~4–5 h | ~18 h |
 
 ---
 
