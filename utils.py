@@ -154,15 +154,17 @@ def save_images(images: np.ndarray, size: list[int], image_path: str | Path) -> 
 
 def image_manifold_size(num_images: int) -> tuple[int, int]:
     """
-    Return (rows, cols) for a near-square grid.
-    For batch_size=64 → (8, 8).
-    Asserts rows * cols == num_images to catch mismatches early.
+    Return (rows, cols) for the largest perfect-rectangle grid that fits
+    num_images, favouring a near-square layout.
+
+    Examples: 64→(8,8), 128→(8,16), 100→(10,10), 90→(9,10).
+    If no exact rectangle exists the count is rounded down to the nearest one.
     """
     rows = int(math.floor(math.sqrt(num_images)))
-    cols = int(math.ceil(math.sqrt(num_images)))
-    assert rows * cols == num_images, (
-        f"image_manifold_size: {num_images} images cannot fill a {rows}×{cols} grid"
-    )
+    # Walk rows downward until we find a factor pair that divides evenly.
+    while rows > 1 and num_images % rows != 0:
+        rows -= 1
+    cols = num_images // rows
     return rows, cols
 
 

@@ -149,7 +149,7 @@ def main() -> None:
         output_height=config.output_height,
         output_width=config.output_width,
         batch_size=config.batch_size,
-        sample_num=config.batch_size,
+        sample_num=64,
         z_dim=config.z_dim,
         gf_dim=config.gf_dim,
         df_dim=config.df_dim,
