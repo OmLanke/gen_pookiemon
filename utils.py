@@ -23,7 +23,7 @@ from PIL import Image
 
 def imread(path: str | Path, grayscale: bool = False) -> np.ndarray:
     """
-    Read an image from disk as a float64 numpy array (range [0, 255]).
+    Read an image from disk as a float32 numpy array (range [0, 255]).
     Drop-in replacement for scipy.misc.imread.
     """
     img = Image.open(path)
