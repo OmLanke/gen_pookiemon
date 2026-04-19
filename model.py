@@ -13,13 +13,15 @@ Key design decisions preserved (from BLUEPRINT.md §12):
   - No BN on Discriminator's first conv layer
   - No BN on Generator's final deconv layer
 
-M1 performance optimisations:
+T4 (CUDA) performance optimisations:
+  - cudnn.benchmark=True: cuDNN autotuner selects fastest kernels for 64×64 inputs
+  - AMP (float16): halves memory and uses T4 Tensor Cores for 2–3× throughput
+  - pin_memory DataLoader: DMA-pinned CPU→GPU transfers for the in-RAM tensor dataset
+  - torch.compile() opt-in flag: TorchInductor fusion for additional kernel speedup
   - Entire dataset pre-loaded into a single CPU tensor at startup (no per-epoch disk I/O)
-  - channels_last DISABLED — BatchNorm2d backward crashes with channels_last on MPS (PyTorch bug)
   - Fused G update: 2× z batch in one forward+backward instead of two (halves G backward passes)
   - DataLoader workers=0 when data is pre-loaded (no fork overhead)
   - .reshape() instead of .view() for channels_last backward compatibility
-  - torch.compile() opt-in flag (CPU/CUDA only; skipped on MPS)
 """
 
 from __future__ import annotations
@@ -228,11 +230,11 @@ class DCGAN:
         input_width: int = 64,
         output_height: int = 64,
         output_width: int = 64,
-        batch_size: int = 64,
+        batch_size: int = 128,
         sample_num: int = 64,
         z_dim: int = 100,
-        gf_dim: int = 32,
-        df_dim: int = 32,
+        gf_dim: int = 64,
+        df_dim: int = 64,
         c_dim: int = 3,
         dataset_name: str = "pokemon",
         input_fname_pattern: str = "*.jpg",
@@ -261,6 +263,9 @@ class DCGAN:
         # ── Device: CUDA > MPS (Apple Silicon) > CPU ──────────────────────────
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
+            # cuDNN autotuner: benchmarks kernel variants at first run and
+            # picks the fastest for our fixed 64×64 input size (~5–15% speedup).
+            torch.backends.cudnn.benchmark = True
         elif torch.backends.mps.is_available():
             self.device = torch.device("mps")
         else:
@@ -283,9 +288,9 @@ class DCGAN:
             input_width=output_width,
         ).to(self.device)
 
-        # channels_last (NHWC) — conv/deconv are faster on Apple Silicon MPS
-        # NOTE: disabled — BatchNorm2d backward crashes with channels_last on MPS
-        # (PyTorch MPS bug). The 45× speedup from RAM preloading is the main win anyway.
+        # channels_last (NHWC) — can be faster on CUDA with Tensor Cores (Ampere+),
+        # but cuDNN defaults to NCHW which is well-optimised for T4 (Turing).
+        # Disabled on MPS: BatchNorm2d backward crashes with channels_last (PyTorch bug).
         # mem_fmt = torch.channels_last
         # self.netG = self.netG.to(memory_format=mem_fmt)
         # self.netD = self.netD.to(memory_format=mem_fmt)
@@ -345,11 +350,13 @@ class DCGAN:
         )
 
         # TensorDataset + DataLoader — no workers needed, data lives in RAM
+        # pin_memory speeds up the CPU→GPU DMA transfer on CUDA devices.
         loader = DataLoader(
             TensorDataset(data_tensor),
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=0,  # data is already in RAM, no workers needed
+            pin_memory=(self.device.type == "cuda"),
             drop_last=True,
         )
 

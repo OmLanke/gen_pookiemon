@@ -43,26 +43,26 @@ def parse_args() -> argparse.Namespace:
         "--learning_rate", type=float, default=0.0002, help="Adam learning rate"
     )
     p.add_argument("--beta1", type=float, default=0.5, help="Adam β1 momentum")
-    p.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    p.add_argument("--batch_size", type=int, default=128, help="Batch size")
 
     # Architecture
     p.add_argument("--z_dim", type=int, default=100, help="Noise vector dimension")
     p.add_argument(
         "--gf_dim",
         type=int,
-        default=32,
-        help="Generator base filter count (32 is ~4× faster on M1; use 64 for full quality)",
+        default=64,
+        help="Generator base filter count (64 for full quality on T4; reduce to 32 to speed up on CPU/MPS)",
     )
     p.add_argument(
         "--df_dim",
         type=int,
-        default=32,
-        help="Discriminator base filter count (32 is ~4× faster on M1; use 64 for full quality)",
+        default=64,
+        help="Discriminator base filter count (64 for full quality on T4; reduce to 32 to speed up on CPU/MPS)",
     )
     p.add_argument(
         "--full",
         action="store_true",
-        help="Full-quality mode: sets gf_dim=64, df_dim=64, epoch=2000 (overrides individual flags)",
+        help="Full-quality mode: sets gf_dim=64, df_dim=64, epoch=2000, batch_size=128 (overrides individual flags)",
     )
     p.add_argument(
         "--c_dim", type=int, default=3, help="Image channels (3=RGB, 1=grayscale)"
