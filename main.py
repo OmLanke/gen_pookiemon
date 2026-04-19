@@ -1,7 +1,5 @@
 """
-main.py — CLI entry point for Pokemon DCGAN
-
-Replaces tf.app.flags with argparse (no TensorFlow dependency at CLI level).
+main.py — CLI entry point for Pookiemon WGAN-GP
 
 Train:
     uv run python main.py --dataset pokemon --train
@@ -22,30 +20,40 @@ import argparse
 import sys
 from pathlib import Path
 
-from model import DCGAN
+from model import WGAN
 from utils import show_all_variables, visualize
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="DCGAN Pokemon image generator",
+        description="WGAN-GP Pokémon image generator",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # Training hyperparameters
     p.add_argument("--epoch", type=int, default=2000, help="Training epochs")
     p.add_argument(
-        "--learning_rate", type=float, default=0.0002, help="Adam learning rate"
+        "--learning_rate", type=float, default=1e-4, help="Adam learning rate"
     )
-    p.add_argument("--beta1", type=float, default=0.5, help="Adam β1 momentum")
+    p.add_argument("--beta1", type=float, default=0.0, help="Adam β1 momentum")
     p.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    p.add_argument(
+        "--n_critic",
+        type=int,
+        default=5,
+        help="Critic updates per generator step",
+    )
+    p.add_argument(
+        "--lambda_gp",
+        type=float,
+        default=10.0,
+        help="Gradient penalty weight λ",
+    )
 
     # Architecture
     p.add_argument("--z_dim", type=int, default=100, help="Noise vector dimension")
     p.add_argument("--gf_dim", type=int, default=64, help="Generator base filter count")
-    p.add_argument(
-        "--df_dim", type=int, default=64, help="Discriminator base filter count"
-    )
+    p.add_argument("--df_dim", type=int, default=64, help="Critic base filter count")
     p.add_argument(
         "--c_dim", type=int, default=3, help="Image channels (3=RGB, 1=grayscale)"
     )
@@ -101,6 +109,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable torch.compile() for faster training (PyTorch ≥ 2.0)",
     )
+    p.add_argument(
+        "--amp",
+        action="store_true",
+        help="Enable AMP (FP16 mixed precision) — recommended for T4/A100 (CUDA only)",
+    )
 
     return p.parse_args()
 
@@ -118,7 +131,7 @@ def main() -> None:
     Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
     Path(config.sample_dir).mkdir(parents=True, exist_ok=True)
 
-    dcgan = DCGAN(
+    wgan = WGAN(
         input_height=config.input_height,
         input_width=config.input_width,
         output_height=config.output_height,
@@ -135,22 +148,25 @@ def main() -> None:
         checkpoint_dir=config.checkpoint_dir,
         sample_dir=config.sample_dir,
         compile_model=config.compile,
+        use_amp=config.amp,
+        n_critic=config.n_critic,
+        lambda_gp=config.lambda_gp,
     )
 
     print("\n── Generator ──────────────────────────────────────────────────")
-    show_all_variables(dcgan.netG)
-    print("── Discriminator ──────────────────────────────────────────────")
-    show_all_variables(dcgan.netD)
+    show_all_variables(wgan.netG)
+    print("── Critic ─────────────────────────────────────────────────────")
+    show_all_variables(wgan.netC)
 
     if config.train:
-        dcgan.train(config)
+        wgan.train(config)
     else:
-        loaded, _ = dcgan.load(config.checkpoint_dir)
+        loaded, _ = wgan.load(config.checkpoint_dir)
         if not loaded:
             print("[!] No checkpoint found. Train a model first:")
             print(f"    uv run python main.py --dataset {config.dataset} --train")
             sys.exit(1)
-        visualize(dcgan, config, option=0)
+        visualize(wgan, config, option=0)
 
 
 if __name__ == "__main__":

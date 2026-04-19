@@ -1,4 +1,5 @@
 # Python-generated files
+.claude/
 __pycache__/
 *.py[oc]
 build/
@@ -11,3 +12,8 @@ wheels/
 # pokemon_dataset/
 data/
 .DS_Store
+
+# Training artifacts
+checkpoint/
+logs/
+samples/

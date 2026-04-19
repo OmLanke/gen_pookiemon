@@ -23,7 +23,7 @@ from PIL import Image
 
 def imread(path: str | Path, grayscale: bool = False) -> np.ndarray:
     """
-    Read an image from disk as a float64 numpy array (range [0, 255]).
+    Read an image from disk as a float32 numpy array (range [0, 255]).
     Drop-in replacement for scipy.misc.imread.
     """
     img = Image.open(path)
@@ -31,7 +31,7 @@ def imread(path: str | Path, grayscale: bool = False) -> np.ndarray:
         img = img.convert("L")
     else:
         img = img.convert("RGB")
-    return np.array(img, dtype=np.float64)
+    return np.array(img, dtype=np.float32)
 
 
 def imsave(images: np.ndarray, size: list[int], path: str | Path) -> None:
@@ -76,7 +76,7 @@ def center_crop(
     cropped = x[j : j + crop_h, i : i + crop_w]
     img = Image.fromarray(cropped.astype(np.uint8))
     img = img.resize((resize_w, resize_h), Image.LANCZOS)
-    return np.array(img, dtype=np.float64)
+    return np.array(img, dtype=np.float32)
 
 
 def transform(
@@ -97,7 +97,7 @@ def transform(
     else:
         img = Image.fromarray(image.astype(np.uint8))
         img = img.resize((resize_width, resize_height), Image.LANCZOS)
-        out = np.array(img, dtype=np.float64)
+        out = np.array(img, dtype=np.float32)
     return normalize(out)
 
 
@@ -171,9 +171,9 @@ def image_manifold_size(num_images: int) -> tuple[int, int]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def visualize(dcgan: object, config: object, option: int = 0) -> None:
+def visualize(model: object, config: object, option: int = 0) -> None:
     """
-    Run the trained sampler and save output image grid.
+    Run the trained generator and save an output image grid.
     option=0: sample z ~ N(-1, 1), generate batch, save timestamped PNG.
     """
     import torch
@@ -184,14 +184,14 @@ def visualize(dcgan: object, config: object, option: int = 0) -> None:
 
     if option == 0:
         z_sample = (
-            torch.randn(config.batch_size, dcgan.z_dim, device=dcgan.device) * 1.0
+            torch.randn(config.batch_size, model.z_dim, device=model.device) * 1.0
         )
         # Remap to N(-1,1) range used during training
         z_sample = z_sample.clamp(-1.0, 1.0)
 
-        dcgan.netG.eval()
+        model.netG.eval()
         with torch.no_grad():
-            samples = dcgan.netG(z_sample)
+            samples = model.netG(z_sample)
 
         # [B, C, H, W] → [B, H, W, C] numpy for save_images
         samples_np = samples.cpu().permute(0, 2, 3, 1).numpy()

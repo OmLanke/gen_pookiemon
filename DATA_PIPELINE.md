@@ -1,12 +1,12 @@
-# Pokemon Master — Data Pipeline
+# Data Pipeline
 
-Complete guide for dataset preparation and the augmentation notebook.
+Complete guide for dataset preparation and the augmentation script.
 
 ---
 
 ## Overview
 
-The dataset pipeline transforms raw Pokemon PNG sprites (transparent background) into a large collection of normalized 64×64 JPEG training images.
+The dataset pipeline transforms raw Pokémon PNG sprites (transparent background) into a large collection of normalised 64×64 JPEG training images suitable for WGAN-GP training.
 
 ```
 Raw PNGs (RGBA, transparent bg)
@@ -54,9 +54,9 @@ Step 6: Rotate ±3°, ±5°, ±7° (each flip)
 
 ---
 
-## Augmentation Notebook Code
+## Augmentation Script Reference
 
-The complete logic from `augmentation.ipynb`, restructured for clarity:
+The complete logic from `augmentation.py`, restructured for clarity:
 
 ### Step 1: RGBA to RGB Conversion
 

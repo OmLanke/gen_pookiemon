@@ -1,10 +1,12 @@
-# Pokimon
+# Pookiemon
 
-A Deep Convolutional Generative Adversarial Network (DCGAN) that generates novel 64×64 Pokémon sprites from random noise.
+A Wasserstein GAN with Gradient Penalty (WGAN-GP) that generates novel 64×64 Pokémon sprites from random noise.
 
 ```
 z ~ N(-1, 1)^100  →  Generator  →  64×64 RGB image
 ```
+
+WGAN-GP replaces the binary cross-entropy loss of a standard GAN with the Wasserstein distance, giving more stable training and gradients that remain informative throughout. See [ARCHITECTURE.md](ARCHITECTURE.md) for the math.
 
 ---
 
@@ -24,23 +26,23 @@ samples/
 ## Architecture
 
 ```
-GENERATOR                              DISCRIMINATOR
+GENERATOR                              CRITIC (no sigmoid, no BN)
 
-z [64, 100]                            image [64, 64×64×3]
+z [B, 100]                             image [B, 3×64×64]
     │                                      │
- Linear                                 Conv 5×5/2 → LeakyReLU      (no BN)
+ Linear                                 Conv 5×5/s2 → LReLU
     │                                      │
- Reshape [64, 4×4×512]                 Conv 5×5/2 → BN → LeakyReLU
+ Reshape [B, 512×4×4]                  Conv 5×5/s2 → LReLU
     │                                      │
- BN → LeakyReLU                        Conv 5×5/2 → BN → LeakyReLU
+ BN → LReLU                            Conv 5×5/s2 → LReLU
     │                                      │
- Deconv → [8×8×256]   BN + LReLU      Conv 5×5/2 → BN → LeakyReLU
- Deconv → [16×16×128] BN + LReLU          │
- Deconv → [32×32×64]  BN + LReLU       Linear → 1
- Deconv → [64×64×3]                        │
-    │                                   Sigmoid
-  Tanh                                      │
-    │                               (prob, logits)
+ Deconv → [256×8×8]   BN + LReLU      Conv 5×5/s2 → LReLU
+ Deconv → [128×16×16] BN + LReLU          │
+ Deconv → [64×32×32]  BN + LReLU       Linear → 1
+ Deconv → [3×64×64]                        │
+    │                                  unbounded score
+  Tanh
+    │
  fake image [-1, 1]
 ```
 
@@ -49,14 +51,16 @@ z [64, 100]                            image [64, 64×64×3]
 | Noise vector `z_dim` | 100 |
 | Noise distribution | `Normal(-1, 1)` |
 | Generator filters `gf_dim` | 64 |
-| Discriminator filters `df_dim` | 64 |
-| Hidden activations | LeakyReLU(0.2) — both G and D |
-| Output activation | Tanh (G), Sigmoid (D) |
+| Critic filters `df_dim` | 64 |
+| Hidden activations | LeakyReLU(0.2) — both G and Critic |
+| Generator output | Tanh |
+| Critic output | Unbounded scalar (no sigmoid) |
 | Batch size | 64 |
 | Epochs | 2000 |
-| Learning rate | 0.0002 |
-| Adam β1 | 0.5 |
-| G updates per batch | 2 always + 1 conditional |
+| Learning rate | 1e-4 |
+| Adam β1 / β2 | 0.0 / 0.9 |
+| Critic updates per step | 5 (`--n_critic`) |
+| Gradient penalty λ | 10 (`--lambda_gp`) |
 
 ---
 
@@ -72,38 +76,24 @@ No manual `pip install` needed. `uv sync` handles everything.
 ## Setup
 
 ```bash
-git clone https://github.com/yourname/pokimon
-cd pokimon
+git clone https://github.com/yourname/pookiemon
+cd pookiemon
 uv sync --all-groups
 ```
-
-This creates `.venv/` and installs PyTorch, Pillow, tqdm, torchvision, and TensorBoard automatically.
 
 ---
 
 ## Dataset
 
-The model trains on Pokémon sprite images (Gen 1–6, ~830 raw PNGs). You need RGBA sprites with transparent backgrounds — the augmentation pipeline handles the rest.
+The model trains on Pokémon sprite images (~830 raw PNGs, Gen 1–6). You need RGBA sprites with transparent backgrounds — the augmentation pipeline converts and expands them automatically.
 
-**Recommended source:** [veekun sprite downloads](https://veekun.com/dex/downloads)
-
-Place raw PNGs in a folder (e.g. `pokemon_sugimori_ori/`), then run the pipeline:
+Place raw PNGs in a folder (e.g. `pokemon_sugimori_ori/`) then run:
 
 ```bash
 uv run python augmentation.py --input_dir pokemon_sugimori_ori
 ```
 
-This produces ~11,600 training images in `data/pokemon/` via a 14× expansion:
-
-| Transform | Count per image |
-|---|---|
-| Original (RGBA→RGB, 64×64) | 1 |
-| Horizontal flip | 1 |
-| Rotate ±3°, ±5°, ±7° (original) | 6 |
-| Rotate ±3°, ±5°, ±7° (flip) | 6 |
-| **Total** | **14** |
-
-Augmentation runs in parallel across all CPU cores. For 830 images it completes in seconds.
+This produces ~11,600 training images in `data/pokemon/` via a 14× augmentation per sprite. See [DATA_PIPELINE.md](DATA_PIPELINE.md) for details.
 
 ---
 
@@ -113,11 +103,14 @@ Augmentation runs in parallel across all CPU cores. For 830 images it completes 
 uv run python main.py --dataset pokemon --train
 ```
 
-All defaults match the intended configuration. Common overrides:
+All defaults match the WGAN-GP configuration. Common overrides:
 
 ```bash
-# Use more epochs
+# More epochs
 uv run python main.py --dataset pokemon --train --epoch 3000
+
+# Tune critic update ratio
+uv run python main.py --dataset pokemon --train --n_critic 5 --lambda_gp 10
 
 # Enable torch.compile for extra throughput (PyTorch ≥ 2.0)
 uv run python main.py --dataset pokemon --train --compile
@@ -134,12 +127,11 @@ uv run python main.py --dataset pokemon --train --compile
 ```
 [*] Using device: mps
 [*] Dataset: 11620 images
-Epoch 1/2000: 100%|████| 181/181 [d_loss: 0.8431, g_loss: 1.2047, t: 23s]
+Epoch 1/2000: [c_loss: -1.2341, g_loss: -0.4521, W_dist: 1.5234, t: 23s]
 [*] Checkpoint saved at epoch 10, step 1811
-...
 ```
 
-Early training loss should hover near `ln(2) ≈ 0.693` for both G and D — that's the equilibrium of a random discriminator.
+The Wasserstein distance (`W_dist`) should rise steadily as the generator improves.
 
 ---
 
@@ -150,7 +142,7 @@ uv run tensorboard --logdir logs/pokemon
 # → http://localhost:6006
 ```
 
-Available panels: `Loss/D`, `Loss/G`, `Loss/D_real`, `Loss/D_fake`, and a live image grid of generated samples.
+Panels: `Loss/Critic`, `Loss/Generator`, `Loss/Wasserstein`, `Loss/GradientPenalty`, and a live image grid of generated samples.
 
 ---
 
@@ -169,9 +161,9 @@ Output saved to `samples/test_YYYY-MM-DD-HH-MM-SS.png`.
 ## Project Structure
 
 ```
-pokimon/
+pookiemon/
 ├── main.py            ← CLI entry point (argparse)
-├── model.py           ← Generator, Discriminator, DCGAN trainer
+├── model.py           ← Generator, Critic, WGAN trainer
 ├── ops.py             ← Layer primitives (conv2d, deconv2d, linear, lrelu, batch_norm)
 ├── utils.py           ← Image I/O (Pillow), grid assembly, visualize
 ├── augmentation.py    ← Dataset preprocessing pipeline
@@ -196,15 +188,17 @@ uv run python main.py [options]
 Training:
   --train                  Enable training mode
   --epoch INT              Training epochs            (default: 2000)
-  --learning_rate FLOAT    Adam learning rate         (default: 0.0002)
-  --beta1 FLOAT            Adam β1 momentum           (default: 0.5)
+  --learning_rate FLOAT    Adam learning rate         (default: 0.0001)
+  --beta1 FLOAT            Adam β1 momentum           (default: 0.0)
   --batch_size INT         Batch size                 (default: 64)
+  --n_critic INT           Critic updates per G step  (default: 5)
+  --lambda_gp FLOAT        Gradient penalty weight λ  (default: 10.0)
   --compile                Enable torch.compile()     (default: off)
 
 Architecture:
   --z_dim INT              Noise vector dimension     (default: 100)
   --gf_dim INT             Generator base filters     (default: 64)
-  --df_dim INT             Discriminator base filters (default: 64)
+  --df_dim INT             Critic base filters        (default: 64)
   --c_dim INT              Image channels, 3=RGB      (default: 3)
 
 Image size:
@@ -223,30 +217,25 @@ Paths:
 
 ---
 
-## Design Notes
+## Why WGAN-GP?
 
-A few intentional deviations from the original DCGAN paper, tuned for Pokémon sprites:
+| Issue | Standard GAN | WGAN-GP |
+|---|---|---|
+| Training stability | Mode collapse common | Stable by design |
+| Loss meaning | BCE — no correlation with image quality | Wasserstein distance — correlates with quality |
+| Gradient flow | Vanishes when discriminator wins | Always informative |
+| Lipschitz constraint | None | Gradient penalty (soft, differentiable) |
 
-| Decision | Paper | This project | Why |
-|---|---|---|---|
-| Noise distribution | Uniform(-1, 1) | **Normal(-1, 1)** | Empirically better for this dataset |
-| Generator activations | ReLU | **LeakyReLU(0.2)** | Better gradient flow through all G layers |
-| G updates per batch | 1× | **2× always + 1× conditional** | Prevents discriminator from winning too fast |
-| BN on first D layer | Varies | **None** | DCGAN paper recommendation |
-
-The conditional third G update fires when `errG − (errD_fake + errD_real) > 1` — i.e. when the generator is falling significantly behind the discriminator.
+The main trade-off: WGAN-GP runs the critic `n_critic` times per generator step (~5× more compute per epoch than a standard GAN). This is offset by needing fewer epochs for stable convergence and no mode collapse.
 
 ---
 
 ## Performance
 
-The implementation is accelerated beyond the original TF1 baseline:
-
 | Feature | Detail |
 |---|---|
 | Device | Auto-selects CUDA → Apple MPS → CPU |
-| Mixed precision | `torch.amp` AMP on CUDA |
-| Data loading | `DataLoader` with 4 parallel workers + `pin_memory` |
+| Data loading | `DataLoader` with 4 parallel workers + `pin_memory` on CUDA |
 | Augmentation | Multiprocess via `ProcessPoolExecutor` |
 | Graph compilation | `torch.compile()` opt-in via `--compile` |
 
